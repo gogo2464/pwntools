@@ -15,6 +15,10 @@ import subprocess
 import sys
 import time
 
+from asyncinit import asyncinit
+
+from multiprocessing import *
+
 if sys.platform != 'win32':
     import fcntl
     import pty
@@ -32,6 +36,11 @@ from pwnlib.util.misc import which
 from pwnlib.util.misc import normalize_argv_env
 from pwnlib.util.packing import _need_bytes
 
+import asyncio
+from asyncio.subprocess import PIPE, STDOUT
+
+
+
 log = getLogger(__name__)
 
 class PTY(object): pass
@@ -41,6 +50,8 @@ PIPE = subprocess.PIPE
 
 signal_names = {-v:k for k,v in signal.__dict__.items() if k.startswith('SIG')}
 
+
+@asyncinit
 class process(tube):
     r"""
     Spawns a new process, and wraps it with a tube for communication.
@@ -217,7 +228,7 @@ class process(tube):
     #: Have we seen the process stop?  If so, this is a unix timestamp.
     _stop_noticed = 0
 
-    def __init__(self, argv = None,
+    async def __init__(self, argv = None,
                  shell = False,
                  executable = None,
                  cwd = None,
@@ -255,11 +266,15 @@ class process(tube):
         if shell:
             executable_val, argv_val, env_val = executable, argv, env
         else:
-            executable_val, argv_val, env_val = self._validate(cwd, executable, argv, env)
+            if sys.platform.startswith("linux"):
+                executable_val, argv_val, env_val = self._validate(cwd, executable, argv, env)
+            elif sys.platform.startswith("win"):#TODO make shell on windows
+                executable_val, argv_val, env_val = executable, argv, env
 
         # Avoid the need to have to deal with the STDOUT magic value.
-        if stderr is STDOUT:
-            stderr = stdout
+        if sys.platform.startswith("linux"):
+            if stderr is STDOUT:
+                stderr = stdout
 
         # Determine which descriptors will be attached to a new PTY
         handles = (stdin, stdout, stderr)
@@ -276,8 +291,12 @@ class process(tube):
         #: Whether setuid is permitted
         self._setuid      = setuid if setuid is None else bool(setuid)
 
-        # Create the PTY if necessary
-        stdin, stdout, stderr, master, slave = self._handles(*handles)
+        if sys.platform.startswith("linux"):
+            # Create the PTY if necessary
+            stdin, stdout, stderr, master, slave = self._handles(*handles)
+        elif sys.platform.startswith("win"):
+            stdin, stdout = os.pipe()
+            stderr = stdout
 
         #: Arguments passed on argv
         self.argv = argv_val
@@ -288,11 +307,14 @@ class process(tube):
         #: Environment passed on envp
         self.env = os.environ if env is None else env_val
 
-        if self.executable is None:
-            if shell:
-                self.executable = '/bin/sh'
-            else:
-                self.executable = which(self.argv[0], path=self.env.get('PATH'))
+        if sys.platform.startswith("linux"):
+            if self.executable is None:
+                if shell:
+                    self.executable = '/bin/sh'
+                else:
+                     self.executable = which(self.argv[0], path=self.env.get('PATH'))
+        elif sys.platform.startswith("win"):
+            pass#TODO implement the which for windows
 
         self._cwd = os.path.realpath(cwd or os.path.curdir)
 
@@ -327,16 +349,24 @@ class process(tube):
                     args = self.argv
                     if prefix:
                         args = prefix + args
+
                     self.proc = subprocess.Popen(args = args,
-                                                 shell = shell,
-                                                 executable = executable,
-                                                 cwd = cwd,
-                                                 env = self.env,
-                                                 stdin = stdin,
-                                                 stdout = stdout,
-                                                 stderr = stderr,
-                                                 close_fds = close_fds,
-                                                 preexec_fn = self.__preexec_fn)
+                                             shell = shell,
+                                             executable = executable,
+                                             cwd = cwd,
+                                             env = self.env,
+                                             stdin = stdin if sys.platform.startswith("linux") else subprocess.PIPE,
+                                             stdout = stdout if sys.platform.startswith("linux") else subprocess.PIPE,
+                                             stderr = stderr if sys.platform.startswith("linux") else subprocess.PIPE,
+                                             close_fds = close_fds if sys.platform.startswith("linux") else None,
+                                             preexec_fn = self.__preexec_fn if sys.platform.startswith("linux") else None)
+
+                    if sys.platform.startswith("win"):
+                        self.proc = await asyncio.create_subprocess_exec(program = args,
+                                                                   stdout=PIPE,
+                                                                   stderr=STDOUT)
+                        self.pid = self.proc.pid
+
                     break
                 except OSError as exception:
                     if exception.errno != errno.ENOEXEC:
@@ -345,33 +375,38 @@ class process(tube):
 
             p.success('pid %i' % self.pid)
 
-        if self.pty is not None:
-            if stdin is slave:
-                self.proc.stdin = os.fdopen(os.dup(master), 'r+b', 0)
-            if stdout is slave:
-                self.proc.stdout = os.fdopen(os.dup(master), 'r+b', 0)
-            if stderr is slave:
-                self.proc.stderr = os.fdopen(os.dup(master), 'r+b', 0)
-
+        if sys.platform.startswith("linux"):
+            if self.pty is not None:
+                if stdin is slave:
+                    self.proc.stdin = os.fdopen(os.dup(master), 'r+b', 0)
+                if stdout is slave:
+                    self.proc.stdout = os.fdopen(os.dup(master), 'r+b', 0)
+                if stderr is slave:
+                    self.proc.stderr = os.fdopen(os.dup(master), 'r+b', 0)
             os.close(master)
             os.close(slave)
+        elif sys.platform.startswith("win"):
+            pass
 
-        # Set in non-blocking mode so that a call to call recv(1000) will
-        # return as soon as a the first byte is available
-        if self.proc.stdout:
-            fd = self.proc.stdout.fileno()
-            fl = fcntl.fcntl(fd, fcntl.F_GETFL)
-            fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
+        if sys.platform.startswith("linux"):
+            # Set in non-blocking mode so that a call to call recv(1000) will
+            # return as soon as a the first byte is available
+            if self.proc.stdout:
+                fd = self.proc.stdout.fileno()
+                fl = fcntl.fcntl(fd, fcntl.F_GETFL)
+                fcntl.fcntl(fd, fcntl.F_SETFL, fl | os.O_NONBLOCK)
 
-        # Save off information about whether the binary is setuid / setgid
-        self.suid = self.uid = os.getuid()
-        self.sgid = self.gid = os.getgid()
-        st = os.stat(self.executable)
-        if self._setuid:
-            if (st.st_mode & stat.S_ISUID):
-                self.suid = st.st_uid
-            if (st.st_mode & stat.S_ISGID):
-                self.sgid = st.st_gid
+            # Save off information about whether the binary is setuid / setgid
+            self.suid = self.uid = os.getuid()
+            self.sgid = self.gid = os.getgid()
+            st = os.stat(self.executable)
+            if self._setuid:
+                if (st.st_mode & stat.S_ISUID):
+                    self.suid = st.st_uid
+                if (st.st_mode & stat.S_ISGID):
+                     self.sgid = st.st_gid
+        elif sys.platform.startswith("win"):
+            pass
 
     def __preexec_fn(self):
         """
@@ -631,25 +666,26 @@ class process(tube):
 
         # In order to facilitate retrieving core files, force an update
         # to the current working directory
-        _ = self.cwd
+        if sys.platform.startswith("linux"):
+            _ = self.cwd
 
-        if block:
-            self.wait_for_close()
+            if block:
+                self.wait_for_close()
 
-        self.proc.poll()
-        returncode = self.proc.returncode
+            self.proc.poll()
+            returncode = self.proc.returncode
 
-        if returncode is not None and not self._stop_noticed:
-            self._stop_noticed = time.time()
-            signame = ''
-            if returncode < 0:
-                signame = ' (%s)' % (signal_names.get(returncode, 'SIG???'))
+            if returncode is not None and not self._stop_noticed:
+                self._stop_noticed = time.time()
+                signame = ''
+                if returncode < 0:
+                    signame = ' (%s)' % (signal_names.get(returncode, 'SIG???'))
 
-            self.info("Process %r stopped with exit code %d%s (pid %i)" % (self.display,
-                                                                  returncode,
-                                                                  signame,
-                                                                  self.pid))
-        return returncode
+                self.info("Process %r stopped with exit code %d%s (pid %i)" % (self.display,
+                                                                      returncode,
+                                                                      signame,
+                                                                      self.pid))
+            return returncode
 
     def communicate(self, stdin = None):
         """communicate(stdin = None) -> str
@@ -668,8 +704,11 @@ class process(tube):
         if not self.connected_raw('recv'):
             raise EOFError
 
-        if not self.can_recv_raw(self.timeout):
-            return ''
+        if sys.platform.startswith("linux"):
+            if not self.can_recv_raw(self.timeout):
+                return ''
+        elif sys.platform.startswith("win"):
+            pass#todo: make it portable
 
         # This will only be reached if we either have data,
         # or we have reached an EOF. In either case, it
@@ -705,6 +744,7 @@ class process(tube):
         pass
 
     def can_recv_raw(self, timeout):
+
         if not self.connected_raw('recv'):
             return False
 
@@ -734,25 +774,26 @@ class process(tube):
             return not self.proc.stdout.closed
 
     def close(self):
-        if self.proc is None:
-            return
+        if sys.platform.startswith("linux"):
+            if self.proc is None:
+                return
 
-        # First check if we are already dead
-        self.poll()
+            # First check if we are already dead
+            self.poll()
 
-        #close file descriptors
-        for fd in [self.proc.stdin, self.proc.stdout, self.proc.stderr]:
-            if fd is not None:
-                fd.close()
+            #close file descriptors
+            for fd in [self.proc.stdin, self.proc.stdout, self.proc.stderr]:
+                if fd is not None:
+                    fd.close()
 
-        if not self._stop_noticed:
-            try:
-                self.proc.kill()
-                self.proc.wait()
-                self._stop_noticed = time.time()
-                self.info('Stopped process %r (pid %i)' % (self.program, self.pid))
-            except OSError:
-                pass
+            if not self._stop_noticed:
+                try:
+                    self.proc.kill()
+                    self.proc.wait()
+                    self._stop_noticed = time.time()
+                    self.info('Stopped process %r (pid %i)' % (self.program, self.pid))
+                except OSError:
+                    pass
 
 
     def fileno(self):

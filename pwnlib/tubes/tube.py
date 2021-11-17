@@ -24,6 +24,11 @@ from pwnlib.util import misc
 from pwnlib.util import packing
 
 
+import asyncio
+import sys
+from asyncio.subprocess import PIPE, STDOUT
+
+
 class tube(Timeout, Logger):
     """
     Container of all the tube functions common to sockets, TTYs and SSH connetions.
@@ -101,8 +106,15 @@ class tube(Timeout, Logger):
             [...] Received 0xc bytes:
                 b'Hello, world'
         """
-        numb = self.buffer.get_fill_size(numb)
-        return self._recv(numb, timeout) or b''
+
+        if sys.platform.startswith("linux"):
+            numb = self.buffer.get_fill_size(numb)
+            return self._recv(numb, timeout) or b''
+        elif sys.platform.startswith("win"):
+            loop = asyncio.ProactorEventLoop()  # For subprocess' pipes on Windows
+            asyncio.set_event_loop(loop)
+            returncode = loop.run_until_complete(self.async_recv(numb, timeout=timeout))
+            return returncode
 
     def unrecv(self, data):
         """unrecv(data)
@@ -184,6 +196,23 @@ class tube(Timeout, Logger):
             return b''
 
         return self.buffer.get(numb)
+
+    async def async_recv(self, numb, timeout):
+        # Read line (sequence of bytes ending with b'\n') asynchronously
+        while True:
+            try:
+                line = await asyncio.wait_for(self.proc.stdout.readline(), timeout)
+            except asyncio.TimeoutError:
+                pass
+            else:
+                if not line:  # EOF
+                    break
+                else:
+                    continue
+            self.proc.kill()  # Timeout or some criterion is not satisfied
+            break
+        return await self.proc.wait()  # Wait for the child process to exit
+
 
     def recvpred(self, pred, timeout = default):
         """recvpred(pred, timeout = default) -> bytes

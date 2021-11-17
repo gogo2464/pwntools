@@ -77,6 +77,8 @@ from pwnlib.util.web import *
 from six.moves import cPickle as pickle, cStringIO as StringIO
 from six import BytesIO
 
+import asyncio
+
 log = getLogger("pwnlib.exploit")
 error   = log.error
 warning = log.warning
@@ -87,5 +89,8 @@ success = log.success
 
 colored_traceback.add_hook()
 
+
 # Equivalence with the default behavior of "from import *"
 # __all__ = [x for x in tuple(globals()) if not x.startswith('_')]
+p = asyncio.run(process(b"C:/Users/yoshi/Desktop/pwintools/tests/pwn.exe"))
+print(p.recv(15, timeout=2))
