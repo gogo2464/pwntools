@@ -13,6 +13,8 @@ import time
 
 from six.moves import range
 
+import asyncio
+
 from pwnlib import atexit
 from pwnlib import term
 from pwnlib.context import context
@@ -148,9 +150,8 @@ class tube(Timeout, Logger):
             3
         """
         data = b''
-
         with self.local(timeout):
-            data = self.recv_raw(self.buffer.get_fill_size())
+            data = self.recv_raw(self.buffer.get_fill_size())#asyncio.run_coroutine_threadsafe(self.recv_raw(self.buffer.get_fill_size()), loop=self.loop)
 
         if data and self.isEnabledFor(logging.DEBUG):
             self.debug('Received %#x bytes:' % len(data))
@@ -760,7 +761,7 @@ class tube(Timeout, Logger):
             self.debug('Sent %#x bytes:' % len(data))
             self.maybe_hexdump(data, level=logging.DEBUG)
 
-        self.send_raw(data)
+        self.send_raw(data)#self.loop.run_until_complete(self.send_raw(data))
 
     def sendline(self, line=b''):
         r"""sendline(data)

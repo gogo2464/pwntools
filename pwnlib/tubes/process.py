@@ -23,6 +23,9 @@ if sys.platform != 'win32':
 
 from threading import Thread, Lock, Event, Condition
 from six.moves.queue import Queue, Empty
+import asyncio
+from contextlib import contextmanager
+import concurrent
 
 from pwnlib import qemu
 from pwnlib.context import context
@@ -44,7 +47,7 @@ PIPE = subprocess.PIPE
 
 signal_names = {-v:k for k,v in signal.__dict__.items() if k.startswith('SIG')}
 
-process_data = b""
+#process_data = b""
 
 class process(tube):
     r"""
@@ -244,10 +247,14 @@ class process(tube):
                  where = 'local',
                  display = None,
                  alarm = None,
+                 loop=None,
                  *args,
                  **kwargs
                  ):
         super(process, self).__init__(*args,**kwargs)
+
+        if context.os == "windows":
+            self.loop = loop
 
         # Permit using context.binary
         if argv is None:
@@ -349,8 +356,18 @@ class process(tube):
                         args = prefix + args
 
                     if context.os == "windows":
-                        stdout = subprocess.PIPE
-                    self.proc = subprocess.Popen(args = args,
+                        #with self.loop_in_thread() as loop:
+                        self.proc = asyncio.run_coroutine_threadsafe(asyncio.create_subprocess_exec(program=args,
+                                                                            env=self.env,
+                                                                            stdin=asyncio.subprocess.PIPE,
+                                                                            stdout=asyncio.subprocess.PIPE,
+                                                                            stderr=asyncio.subprocess.STDOUT,
+                                                                         loop=loop), loop).result()
+
+
+
+                    else:
+                        self.proc = subprocess.Popen(args = args,
                                                  shell = shell,
                                                  executable = executable,
                                                  cwd = cwd,
@@ -360,13 +377,23 @@ class process(tube):
                                                  stderr = stderr,
                                                  close_fds = close_fds,
                                                  preexec_fn = self.__preexec_fn if not context.os == "windows" else None)
+
+                    #if context.os == "windows":
+                    #self.loop = asyncio.ProactorEventLoop()
+                    #asyncio.set_event_loop(self.loop)
+                    #self.proc = asyncio.run_coroutine_threadsafe(self.run_process(args, stdout, stdin, stderr), self.loop).result(timeout=10)
+
                     break
                 except OSError as exception:
                     if exception.errno != errno.ENOEXEC:
                         raise
                     prefixes.append(self.__on_enoexec(exception))
 
-            p.success('pid %i' % self.pid)
+            if context.os == "windows":
+                #pid = asyncio.run_coroutine_threadsafe(self.run_process(args, stdout, stdin, stderr), self.loop).result()
+                p.success('pid %i' % 123)
+            else:
+                p.success('pid %i' % self.pid)
 
         if context.os != "windows":
             if self.pty is not None:
@@ -396,6 +423,46 @@ class process(tube):
                     self.suid = st.st_uid
                 if (st.st_mode & stat.S_ISGID):
                     self.sgid = st.st_gid
+
+    async def load_pid(self):
+        return await self.proc.pid
+
+    import asyncio
+    import contextlib
+    import concurrent.futures
+
+    @contextlib.contextmanager
+    def loop_in_thread(self):
+        with concurrent.futures.ThreadPoolExecutor() as tpe:
+            started_fut = concurrent.futures.Future()
+
+            async def main():
+                loop = asyncio.get_running_loop()
+                event = asyncio.Event()
+                started_fut.set_result((loop, event))
+                await event.wait()
+
+            done_fut = tpe.submit(asyncio.run, main())
+            for fut in concurrent.futures.as_completed((started_fut, done_fut)):
+                if fut is started_fut:
+                    loop, event = started_fut.result()
+                    try:
+                        yield loop
+                    finally:
+                        loop.call_soon_threadsafe(event.set)
+                if fut is done_fut:
+                    done_fut.result()
+
+    async def run_process(self, exe, stdout, stdin, stderr):
+        if context.os == "windows":
+
+            return await asyncio.create_subprocess_exec(program=exe,
+                                                        env=self.env,
+                                                        stdin=asyncio.subprocess.PIPE,
+                                                        stdout=asyncio.subprocess.PIPE,
+                                                        stderr=asyncio.subprocess.STDOUT)#close_fds=None,#self.close_fds
+                                                        #preexec_fn=self.__preexec_fn if not context.os == "windows" else None)#,
+                                                        #loop=self.loop
 
     def __preexec_fn(self):
         """
@@ -664,7 +731,9 @@ class process(tube):
         if block:
             self.wait_for_close()
 
-        self.proc.poll()
+
+        if not sys.platform.startswith("win"):
+            self.proc.poll()
         returncode = self.proc.returncode
 
         if returncode is not None and not self._stop_noticed:
@@ -687,9 +756,10 @@ class process(tube):
 
         return self.proc.communicate(stdin)
 
-    # Implementation of the methods required for tube
     def recv_raw(self, numb):
-        if context.os != "windows":
+        if context.os == "windows":
+            return asyncio.run_coroutine_threadsafe(self._recv_raw(numb), loop=self.loop).result()
+        else:
             # This is a slight hack. We try to notice if the process is
             # dead, so we can write a message.
             self.poll()
@@ -697,8 +767,8 @@ class process(tube):
             if not self.connected_raw('recv'):
                 raise EOFError
 
-            if not self.can_recv_raw(self.timeout):
-                return ''
+            # if not self.can_recv_raw(self.timeout):
+            #    return ''
 
             # This will only be reached if we either have data,
             # or we have reached an EOF. In either case, it
@@ -715,71 +785,61 @@ class process(tube):
                 raise EOFError
 
             return data
-        else:
-            global process_data
-            def read_process(ev, numb):
-                global process_data
+        
+    # Implementation of the methods required for tube
+    async def _recv_raw(self, numb):
+        #global process_data
 
-                if numb is None:
-                    while True:
-                        new_character = self.proc.stdout.read(1)
-                        if new_character is not None:
-                            process_data += new_character
-                        else:
-                            raise EOFError
-                else:
-                    for i in range(numb):
-                        new_character = self.proc.stdout.read(1)
-                        if new_character is not None:
-                            process_data += new_character
-                        else:
-                            raise EOFError
-                    ev.set()
+        #self.poll()
 
+        if not self.connected_raw('recv'):
+            raise EOFError
+
+        #if not self.can_recv_raw(self.timeout):
+        #    return ''
+
+        try:
             process_data = b""
+            process_data = await asyncio.wait_for(self.read_process(numb), timeout=self.timeout)#self.read_process(numb)#
+        except asyncio.TimeoutError:
+            return process_data
+        return process_data
 
-            self.poll()
+    async def read_process(self, numb):
+        global process_data
+        process_data = b""
 
-            if not self.connected_raw('recv'):
-                raise EOFError
-
-            #if not self.can_recv_raw(self.timeout):
-            #    return ''
-
-            e = Event()
-            c = Condition()
-
-            try:
-                t = Thread(target=read_process, args=(e, numb))
-                t.daemon = True
-                t.start()
-                timed_out = not e.wait(timeout=self.timeout)
-                if not timed_out:
-                    t.join()  # neat and tidy, clean up as we go
-            except Empty:
-                return process_data
-            except IOError:
-                pass
-            except EOFError:
-                raise EOFError
-
-            if process_data is None:
-                self.shutdown("recv")
-                raise EOFError
-
+        if numb is None:
+            while True:
+                new_character = await self.proc.stdout.read(1)
+                if new_character is not None:
+                    process_data += new_character
+                else:
+                    break
+        else:
+            for i in range(numb):
+                new_character = await self.proc.stdout.read(1)
+                if new_character is not None:
+                    process_data += new_character
+                else:
+                    break
             return process_data
 
     def send_raw(self, data):
         # This is a slight hack. We try to notice if the process is
         # dead, so we can write a message.
-        self.poll()
+        if context.os == "windows":
+            pass
+        else:
+            self.poll()
 
         if not self.connected_raw('send'):
             raise EOFError
 
         try:
             self.proc.stdin.write(data)
-            self.proc.stdin.flush()
+            if context.os != "windows":
+                self.proc.stdin.flush()
         except IOError:
             raise EOFError
 
@@ -818,35 +878,46 @@ class process(tube):
         if direction == 'any':
             return self.poll() is None
         elif direction == 'send':
-            return not self.proc.stdin.closed
+            if context.os == "windows":
+                return not self.proc.stdin.is_closing()
+            else:
+                return not self.proc.stdin.closed
         elif direction == 'recv':
-            return not self.proc.stdout.closed
+            if sys.platform.startswith("win"):
+                return not self.proc.stdout.at_eof()#return True
+            else:
+                return not self.proc.stdin.closed
 
     def close(self):
-        if self.proc is None:
-            return
+        if context.os == "windows":
+            pass
+        else:
+            if self.proc is None:
+                return
 
-        # First check if we are already dead
-        self.poll()
+            # First check if we are already dead
+            self.poll()
 
-        # close file descriptors
-        for fd in [self.proc.stdin, self.proc.stdout, self.proc.stderr]:
-            if fd is not None:
+            # close file descriptors
+            for fd in [self.proc.stdin, self.proc.stdout, self.proc.stderr]:
+                if fd is not None:
+                    try:
+                        fd.close()
+                    except IOError as e:
+                        if e.errno != errno.EPIPE:
+                            raise
+
+            if not self._stop_noticed:
                 try:
-                    fd.close()
-                except IOError as e:
-                    if e.errno != errno.EPIPE:
-                        raise
+                    self.proc.kill()
+                    asyncio.run_coroutine_threadsafe(self.wait_process())
+                    self._stop_noticed = time.time()
+                    self.info('Stopped process %r (pid %i)' % (self.program, self.pid))
+                except OSError:
+                    pass
 
-        if not self._stop_noticed:
-            try:
-                self.proc.kill()
-                self.proc.wait()
-                self._stop_noticed = time.time()
-                self.info('Stopped process %r (pid %i)' % (self.program, self.pid))
-            except OSError:
-                pass
-
+    async def wait_process(self):
+       await self.proc.wait()
 
     def fileno(self):
         if not self.connected():
@@ -861,8 +932,13 @@ class process(tube):
         if direction == "recv":
             self.proc.stdout.close()
 
-        if False not in [self.proc.stdin.closed, self.proc.stdout.closed]:
-            self.close()
+        if context.os == "windows":
+            pass
+            #if False not in [self.proc.stdin.is_closing(), self.proc.stdout.at_eof()]:
+            #    self.close()
+        else:
+            if False not in [self.proc.stdin.closed, self.proc.stdout.closed]:
+                self.close()
 
     def __pty_make_controlling_tty(self, tty_fd):
         '''This makes the pseudo-terminal the controlling tty. This should be
