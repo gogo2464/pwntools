@@ -21,7 +21,7 @@ if sys.platform != 'win32':
     import resource
     import tty
 
-from threading import Thread, Lock
+from threading import Thread, Lock, Event, Condition
 from six.moves.queue import Queue, Empty
 
 from pwnlib import qemu
@@ -43,6 +43,8 @@ STDOUT = subprocess.STDOUT
 PIPE = subprocess.PIPE
 
 signal_names = {-v:k for k,v in signal.__dict__.items() if k.startswith('SIG')}
+
+process_data = b""
 
 class process(tube):
     r"""
@@ -137,13 +139,13 @@ class process(tube):
         True
         >>> p.connected('send')
         False
-        >>> p.recvline()
-        b'Hello world\n'
+        >>> p.recvline() == (b'Hello world\r\n' if context.os == "windows" else b'Hello world\n')
+        True
         >>> p.recvuntil(b',')
         b'Wow,'
         >>> p.recvregex(b'.*data')
         b' such data'
-        >>> p.recv() == (b'\r\n' if sys.platform.startswith("win") else b'\n')
+        >>> p.recv() == (b'\r\n' if context.os == "windows" else b'\n')
         True
         >>> p.recv() # doctest: +ELLIPSIS
         Traceback (most recent call last):
@@ -714,51 +716,58 @@ class process(tube):
 
             return data
         else:
-            def read_process(queue, numb):
+            global process_data
+            def read_process(ev, numb):
+                global process_data
+
                 if numb is None:
                     while True:
                         new_character = self.proc.stdout.read(1)
                         if new_character is not None:
-                            self.data += new_character
+                            process_data += new_character
                         else:
-                            break
+                            raise EOFError
                 else:
                     for i in range(numb):
                         new_character = self.proc.stdout.read(1)
                         if new_character is not None:
-                            self.data += new_character
+                            process_data += new_character
                         else:
-                            break
-                    queue.put(self.data)
+                            raise EOFError
+                    ev.set()
 
-            self.data = b""
+            process_data = b""
+
+            self.poll()
+
+            if not self.connected_raw('recv'):
+                raise EOFError
+
+            #if not self.can_recv_raw(self.timeout):
+            #    return ''
+
+            e = Event()
+            c = Condition()
+
             try:
-                q = Queue()
-                t = Thread(target=read_process, args=(q, numb))
-                t.daemon = False
+                t = Thread(target=read_process, args=(e, numb))
+                t.daemon = True
                 t.start()
-            except Exception as e:
-                print("exception:" + e)
-
-            try:
-                line = q.get(block=True, timeout=self.timeout)
+                timed_out = not e.wait(timeout=self.timeout)
+                if not timed_out:
+                    t.join()  # neat and tidy, clean up as we go
             except Empty:
-                data = self.data
-                self.data = b""
-                return data
+                return process_data
             except IOError:
                 pass
             except EOFError:
                 raise EOFError
-            else:
-                self.data = b""
-                return line
 
-            if not data:
+            if process_data is None:
                 self.shutdown("recv")
                 raise EOFError
 
-            return data
+            return process_data
 
     def send_raw(self, data):
         # This is a slight hack. We try to notice if the process is
