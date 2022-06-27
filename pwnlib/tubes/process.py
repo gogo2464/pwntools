@@ -25,6 +25,7 @@ from threading import Thread, Lock, Event, Condition
 from six.moves.queue import Queue, Empty
 import asyncio
 from contextlib import contextmanager
+import contextlib
 import concurrent
 
 from pwnlib import qemu
@@ -47,7 +48,27 @@ PIPE = subprocess.PIPE
 
 signal_names = {-v:k for k,v in signal.__dict__.items() if k.startswith('SIG')}
 
-#process_data = b""
+@contextlib.contextmanager
+def loop_in_thread():
+    with concurrent.futures.ThreadPoolExecutor() as tpe:
+        started_fut = concurrent.futures.Future()
+
+        async def main():
+            loop = asyncio.get_running_loop()
+            event = asyncio.Event()
+            started_fut.set_result((loop, event))
+            await event.wait()
+
+        done_fut = tpe.submit(asyncio.run, main())
+        for fut in concurrent.futures.as_completed((started_fut, done_fut)):
+            if fut is started_fut:
+                loop, event = started_fut.result()
+                try:
+                    yield loop
+                finally:
+                    loop.call_soon_threadsafe(event.set)
+            if fut is done_fut:
+                done_fut.result()
 
 class process(tube):
     r"""
@@ -356,8 +377,10 @@ class process(tube):
                         args = prefix + args
 
                     if context.os == "windows":
-                        #with self.loop_in_thread() as loop:
-                        self.proc = asyncio.run_coroutine_threadsafe(asyncio.create_subprocess_exec(program=args,
+                        asyncio.set_event_loop(None)
+                        self.loop = loop_in_thread()
+                        self.proc = asyncio.run_coroutine_threadsafe(asyncio.create_subprocess_exec(
+                                                                        program=args,
                                                                             env=self.env,
                                                                             stdin=asyncio.subprocess.PIPE,
                                                                             stdout=asyncio.subprocess.PIPE,
