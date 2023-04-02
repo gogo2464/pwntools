@@ -64,6 +64,7 @@ Each of the ``pwntools`` modules is documented here.
    memleak
    protocols
    qemu
+   radare2
    replacements
    rop/*
    runner
