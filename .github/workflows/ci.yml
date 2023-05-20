@@ -74,7 +74,12 @@ jobs:
           binutils-sparc64-linux-gnu \
           gcc-multilib \
           libc6-dbg \
-          elfutils
+          elfutils ;
+        git clone https://github.com/radareorg/radare2
+        cd radare2
+        sh sys/install.sh
+        git reset --hard b3ee967
+        cd ..
       
     - name: Testing Corefiles
       run: |
