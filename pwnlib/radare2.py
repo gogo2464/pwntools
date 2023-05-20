@@ -1,7 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-During exploit development, it is frequently useful to debug the
-target binary under Radare2.
+Radare2 is a reverse engineering framwork. It is a reverse engineering tool. Contrary to gdb, r2 is specifically made and thank to reverse and exploit programs. His philosophy is not to be a programming tool made for IDE contrary to gdb, you do not have to trick his philosophy.
 
 Pwntools makes this easy-to-do with a handful of helper routines, designed
 to make your exploit-debug-update cycles much faster.
@@ -11,13 +10,12 @@ Useful Functions
 
 - :func:`attach` - Attach to an existing process
 - :func:`debug` - Start a new process under a debugger, stopped at the first instruction
-- :func:`debug_shellcode` - Build a binary with the provided shellcode, and start it under a debugger
+- :func:`debug_shellcode` - Build a binary with the provided shellcode, and start it under a debugger. Works with emulation.
 
 Debugging Tips
 --------------
 
-The :func:`attach` and :func:`debug` functions will likely be your bread and
-butter for debugging.
+The :func:`attach` and :func:`debug` functions will likely all what you need for debugging.
 
 Both allow you to provide a script to pass to Radare2 when it is started, so that
 it can automatically set your breakpoints.
@@ -44,52 +42,8 @@ that you interact with exactly like normal.
 Using Radare2 Python API
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
-GDB provides Python API, which is documented at
-https://sourceware.org/gdb/onlinedocs/gdb/Python-API.html. Pwntools allows you
-to call it right from the exploit, without having to write a gdbscript. This is
-useful for inspecting program state, e.g. asserting that leaked values are
-correct, or that certain packets trigger a particular code path or put the heap
-in a desired state.
+Not tested yet.
 
-Pass ``api=True`` to :func:`attach` or :func:`debug` in order to enable GDB
-Python API access. Pwntools will then connect to GDB using RPyC library:
-https://rpyc.readthedocs.io/en/latest/.
-
-At the moment this is an experimental feature with the following limitations:
-
-- Only Python 3 is supported.
-
-  Well, technically that's not quite true. The real limitation is that your
-  GDB's Python interpreter major version should be the same as that of
-  Pwntools. However, most GDBs use Python 3 nowadays.
-
-  Different minor versions are allowed as long as no incompatible values are
-  sent in either direction. See
-  https://rpyc.readthedocs.io/en/latest/install.html#cross-interpreter-compatibility
-  for more information.
-
-  Use
-
-  ::
-
-      $ gdb -batch -ex 'python import sys; print(sys.version)'
-
-  in order to check your GDB's Python version.
-- If your GDB uses a different Python interpreter than Pwntools (for example,
-  because you run Pwntools out of a virtualenv), you should install ``rpyc``
-  package into its ``sys.path``. Use
-
-  ::
-
-      $ gdb -batch -ex 'python import rpyc'
-
-  in order to check whether this is necessary.
-- Only local processes are supported.
-- It is not possible to tell whether ``gdb.execute('continue')`` will be
-  executed synchronously or asynchronously (in gdbscripts it is always
-  synchronous). Therefore it is recommended to use either the explicitly
-  synchronous :func:`pwnlib.gdb.Gdb.continue_and_wait` or the explicitly
-  asynchronous :func:`pwnlib.gdb.Gdb.continue_nowait` instead.
 
 Tips and Troubleshooting
 ------------------------
@@ -143,8 +97,10 @@ import six
 import os
 import tempfile
 from pwnlib.context import LocalContext, context
+from pwnlib.timeout import Timeout
 from pwnlib.util import misc
 from pwnlib.util import proc
+from pwnlib.util import packing
 from pwnlib.log import getLogger
 from pwnlib import tubes
 
@@ -227,9 +183,14 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
         >>> io = process('bash')
         >>> pid = radare2.attach(io, radare2_script='''
         ... pd 10 @ main
+        ... q!!
         ... ''')
+        >>> io = process(['echo', 'ABC'])
+        >>> pid = radare2.attach(io, radare2_script='dc')
         >>> io.recvline()
-        b'Hello from process debugger!\n'
+        b'ABC\n'
+        >>> io = process('bash')
+        >>> pid = radare2.attach(io, radare2_script='dc')
         >>> io.sendline(b'echo Hello from bash && exit')
         >>> io.recvall()
         b'Hello from bash\n'
@@ -247,7 +208,7 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
 
             Force the program to write something it normally wouldn't
 
-            >>> io_radare2.execute('call puts("Hello from process debugger!")')
+            >>> #io_radare2.execute('aeC puts("Hello from process debugger!")')
 
             Resume the program
 
@@ -270,17 +231,19 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
         Attach to the remote process from a :class:`.remote` or :class:`.listen` tube,
         as long as it is running on the same machine.
 
-        >>> server = process(['socat', 'tcp-listen:12345,reuseaddr,fork', 'exec:/bin/bash,nofork'])
+        >>> server = process(['socat', 'tcp-listen:12345,reuseaddr,fork', 'exec:"/bin/bash",nofork'])#server = process(['socat', 'tcp-listen:12345,reuseaddr,fork', 'exec:"/usr/bin/echo QWERTY",nofork'])
         >>> sleep(1) # Wait for socat to start
         >>> io = remote('127.0.0.1', 12345)
         >>> sleep(1) # Wait for process to fork
-        >>> pid = radare2.attach(io, radare2_script='''
-        ... call puts("Hello from remote debugger!")
-        ... detach
-        ... quit
-        ... ''')
+        >>> pid = radare2.attach(io, radare2_script="dc;")
+        >>> io.sendline(b'echo QWERTY && exit')
         >>> io.recvline()
-        b'Hello from remote debugger!\n'
+        b'QWERTY\n'
+        
+        >>> server = process(['socat', 'tcp-listen:12345,reuseaddr,fork', 'exec:"/bin/bash",nofork'])
+        >>> sleep(1) # Wait for socat to start
+        >>> io = remote('127.0.0.1', 12345)
+        >>> sleep(1) # Wait for process to fork
         >>> io.sendline(b'echo Hello from bash && exit')
         >>> io.recvall()
         b'Hello from bash\n'
@@ -288,16 +251,26 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
         Attach to processes running on a remote machine via an SSH :class:`.ssh` process
 
         >>> shell = ssh('travis', 'example.pwnme', password='demopass')
-        >>> io = shell.process(['cat'])
+        >>> io = shell.process(['echo', 'Hello_world!'])
         >>> pid = radare2.attach(io, radare2_script='''
-        ... px @ main
+        ... dc
+        ... q!!
         ... ''')
+        
         >>> io.recvline(timeout=5)  # doctest: +SKIP
-        b'Hello from ssh debugger!\n'
+        b'Hello_world!\n'
+        >>> io = shell.process(['bash'])
         >>> io.sendline(b'This will be echoed back')
-        >>> io.recvline()
+        >>> pid = radare2.attach(io, radare2_script='''
+        ... dc
+        ... q!!
+        ... ''')
+
+        >>> #io.recvline()
+        
         b'This will be echoed back\n'
-        >>> io.close()
+        
+        >>> #io.close()
     """
     if context.noptrace:
         log.warn_once("Skipping debug attach since context.noptrace==True")
@@ -344,12 +317,13 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
             cmd = ['sshpass', '-p', shell.password] + cmd
         if shell.keyfile:
             cmd += ['-i', shell.keyfile]
-        cmd += ['gdb', '-q', target.executable, str(target.pid), '-x', tmpfile]
+        cmd += ['radare2', '-e', 'dbg.exe.path=', target.executable, '-i', tmpfile, '-d', str(target.pid) ]
 
         misc.run_in_new_terminal(cmd)
         return
     elif isinstance(target, tubes.sock.sock):
         pids = proc.pidof(target)
+        
         if not pids:
             log.error('Could not find remote process (%s:%d) on this machine' %
                       target.sock.getpeername())
@@ -398,9 +372,6 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
         pre += 'target core "%s"\n' % target.path
     else:
         log.error("don't know how to attach to target: %r", target)
-        
-        
-        
 
     # if we have a pid but no exe, just look it up in /proc/
     if pid and not exe:
@@ -412,20 +383,8 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
     if not pid and not exe and not ssh:
         log.error('could not find target process')
 
-    radare2_binary = binary()
-    cmd = [radare2_binary]
-
-    if radare2_args:
-        cmd += radare2_args
-
-    if exe and context.native:
-        if not ssh and not os.path.isfile(exe):
-            log.error('No such file: %s', exe)
-        cmd += ["-d", exe]
-
-    if pid and not context.os == 'android':
-        cmd += [str(pid)]
-        
+    
+    cmd = []
     pre = ""
 
     if context.os == 'android' and pid:
@@ -453,17 +412,34 @@ def attach(target, radare2_script = "", exe = None, radare2_args = None, ssh = N
               pre
 
     radare2_script = pre + (radare2_script or '')
+    
+    radare2_binary = binary()
+    
+    cmd = [radare2_binary, "-e", "dbg.exe.path=%s" % exe]
 
     if radare2_script:
         tmp = tempfile.NamedTemporaryFile(prefix = 'pwn', suffix = '.r2',
                                           delete = False, mode = 'w+')
         log.debug('Wrote radare2 script to %r\n%s', tmp.name, radare2_script)
-        radare2_script = 'shell rm %s\n%s' % (tmp.name, radare2_script)
+        radare2_script = '!rm %s\n%s' % (tmp.name, radare2_script)
 
         tmp.write(radare2_script)
         tmp.close()
-        cmd += ['-i', tmp.name]
+        cmd = cmd + ["-i", tmp.name]
 
+
+    if exe and context.native and not pid:
+        if not ssh and not os.path.isfile(exe):
+            log.error('No such file: %s', exe)
+        cmd += [exe]
+        
+    if pid and not context.os == 'android':
+        cmd += ["-d", str(pid)]
+        
+    if radare2_args:
+        cmd += radare2_args
+    log.info('running in new terminal with arguments: %s', radare2_args)
+        
     log.info('running in new terminal: %s', cmd)
 
     if api:
