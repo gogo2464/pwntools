@@ -95,6 +95,7 @@ jobs:
         pip install --upgrade wheel build
         pip install --upgrade flake8 appdirs
         pip install --upgrade --editable .
+        git clone https://github.com/radareorg/radare2 ; cd radare2 ; sudo sh sys/install.sh ; cd .. ;
 
     - name: Sanity checks
       run:  PWNLIB_NOTERM=1 python -bb -c 'from pwn import *; print(pwnlib.term.term_mode)'
